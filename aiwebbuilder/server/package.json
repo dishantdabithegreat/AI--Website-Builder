@@ -13,6 +13,7 @@
   "type": "module",
   "dependencies": {
     "@ai-sdk/openai": "^4.0.114",
+    "@babel/parser": "^8.1.0",
     "ai": "^7.0.169",
     "bcrypt": "^6.0.0",
     "cookie-parser": "^1.4.7",

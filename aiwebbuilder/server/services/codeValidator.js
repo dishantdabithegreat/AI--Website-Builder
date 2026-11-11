@@ -1,3 +1,5 @@
+import { parse } from "@babel/parser";
+
 // Post-generation code validator and auto-fixer
 // Repairs common AI code generation errors before saving to DB using regex checks
 
@@ -115,6 +117,23 @@ export function validateAndFixCode(code, filePath, context) {
         const fixResult = fixImportPaths(code, filePath, context.allPlannedFiles);
         code = fixResult.code;
         warnings.push(...fixResult.warnings);
+    }
+
+    // Parse the final JavaScript/JSX instead of relying on regex checks alone.
+    // This catches malformed expressions such as: onChange={(e) = /> ...}
+    try {
+        parse(code, {
+            sourceType: "module",
+            plugins: ["jsx"],
+            errorRecovery: false,
+        });
+    } catch (error) {
+        const location = error.loc
+            ? ` (${error.loc.line}:${error.loc.column + 1})`
+            : "";
+        throw new SyntaxError(
+            `[${filePath}] Invalid JavaScript/JSX${location}: ${error.message}`
+        );
     }
 
     return { code: code.trim() + "\n", warnings };
