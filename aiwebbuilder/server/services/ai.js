@@ -16,7 +16,7 @@ const openrouter = createOpenAI({
     apiKey: process.env.OPENROUTER_API_KEY,
 })
 
-const model = openrouter(MODEL);
+const model = openrouter.chat(MODEL);
 
 // Generate a single file's code
 async function generateSingleFile(file, allFiles, prompt, alreadyGeneratedFiles){
@@ -137,29 +137,30 @@ export async function generateProject(prompt, callbacks){
          pendingFiles = failedFiles;
     }
 
-    if(pendingFiles.length > 0){
-        const failedPaths = pendingFiles.map((f)=>f.path).join(", ");
+    if (pendingFiles.length > 0) {
+        const failedPaths = pendingFiles.map((f) => f.path).join(", ");
         console.error(`[AI] Failed to generate ${pendingFiles.length} files after all retry rounds: ${failedPaths}`);
 
-        if (pendingFiles.some((f) => f.path === "/App.js")){
-            const ext = file.path.split(".").pop()?.toLowerCase();
+        // Keep the preview bootable if an individual file exhausts its retries.
+        for (const failedFile of pendingFiles) {
+            const path = failedFile.path.startsWith("/") ? failedFile.path : `/${failedFile.path}`;
+            const ext = path.split(".").pop()?.toLowerCase();
 
-            if(ext === "css"){
-                files[file.path] = `/* ${file.description} — Generation failed, please retry */\n`
-            }else{
-                files[file.path] = "import React from 'react';\n\n" + 
-                `// ⚠️ This file could not be generated. Please retry.\n` +
-                `// Purpose: ${file.description}\n\n` + 
-                "export default function Placeholder() {\n" +
-                "  return (\n" +
+            if (ext === "css") {
+                files[path] = `/* ${failedFile.description} — generation failed; please retry */\n`;
+            } else {
+                files[path] = "import React from 'react';\n\n" +
+                    `// This file could not be generated. Please retry.\n` +
+                    `// Purpose: ${failedFile.description}\n\n` +
+                    "export default function Placeholder() {\n" +
+                    "  return (\n" +
                     "    <div className='p-8 text-center text-zinc-400'>\n" +
-                    "      <p>⚠️ Component failed to generate. Please try again.</p>\n" +
+                    "      <p>Component generation failed. Please retry.</p>\n" +
                     "    </div>\n" +
                     "  );\n" +
                     "}\n";
             }
         }
-
     }
 
     if(!files["/App.js"]){
