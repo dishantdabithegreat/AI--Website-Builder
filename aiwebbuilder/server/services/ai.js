@@ -5,6 +5,7 @@ import { FileCodeSchema, FilePlanSchema, RevisionResultSchema } from "./aiSchema
 import { buildFileCodeSystem, FILE_PLAN_SYSTEM, REVISE_SYSTEM } from "./prompts.js";
 import { normalizeContent } from "./contentNormalizer.js";
 import { validateAndFixCode, validateRevisionContent } from "./codeValidator.js";
+import { parse } from "@babel/parser";
 
 // --- OpenRouter Model Client Setup ---
 const MODEL = process.env.OPENROUTER_MODEL || "openrouter/free";
@@ -106,6 +107,162 @@ ${code}
     console.log(`[AI] Created file: ${file.path} (${code.length} chars)`);
     return { path: file.path, code };
 }
+
+
+// Normalize paths such as /components/../Header.js
+function normalizeProjectPath(filePath) {
+    const parts = [];
+
+    for (const part of filePath.split("/")) {
+        if (!part || part === ".") continue;
+
+        if (part === "..") {
+            parts.pop();
+        } else {
+            parts.push(part);
+        }
+    }
+
+    return "/" + parts.join("/");
+}
+
+// Find local imports in generated JavaScript/JSX files.
+
+function getLocalImports(code) {
+    const ast = parse(code, {
+        sourceType: "unambiguous",
+        plugins: ["jsx"],
+    });
+
+    const imports = [];
+
+    function walk(node) {
+        if (!node || typeof node !== "object") return;
+
+        if (
+            node.type === "ImportDeclaration" ||
+            node.type === "ExportNamedDeclaration" ||
+            node.type === "ExportAllDeclaration"
+        ) {
+            if (node.source?.value) {
+                imports.push(node.source.value);
+            }
+        }
+
+        // Detect require("./file")
+        if (
+            node.type === "CallExpression" &&
+            node.callee?.type === "Identifier" &&
+            node.callee.name === "require" &&
+            node.arguments?.[0]?.type === "StringLiteral"
+        ) {
+            imports.push(node.arguments[0].value);
+        }
+
+        // Detect dynamic imports: import("./Component")
+        if (
+            node.type === "ImportExpression" &&
+            node.source?.type === "StringLiteral"
+        ) {
+            imports.push(node.source.value);
+        }
+
+        // Compatibility with Babel AST versions using CallExpression
+        if (
+            node.type === "CallExpression" &&
+            node.callee?.type === "Import" &&
+            node.arguments?.[0]?.type === "StringLiteral"
+        ) {
+            imports.push(node.arguments[0].value);
+        }
+
+        for (const value of Object.values(node)) {
+            if (Array.isArray(value)) {
+                value.forEach(walk);
+            } else if (value && typeof value === "object") {
+                walk(value);
+            }
+        }
+    }
+
+    ast.program.body.forEach(walk);
+
+    return [...new Set(imports)];
+}
+
+
+// Check whether a relative import resolves to an existing generated file.
+function findMissingLocalImports(files) {
+    const existingFiles = new Set(
+        Object.keys(files).map(normalizeProjectPath)
+    );
+
+    const missing = [];
+
+    for (const [filePath, code] of Object.entries(files)) {
+        if (!/\.(js|jsx)$/.test(filePath)) continue;
+
+        const imports = getLocalImports(code);
+
+        for (const specifier of imports) {
+            if (!specifier.startsWith(".")) continue;
+            // Ignore static assets and media files.
+            if (
+                /\.(svg|png|jpe?g|webp|gif|ico|avif|mp4|webm|mp3|wav|woff2?|ttf|otf|eot)(\?.*)?$/i.test(specifier)
+            ) {
+                continue;
+            }
+
+            const currentPath = normalizeProjectPath(filePath);
+            const directory = currentPath.slice(
+                0,
+                currentPath.lastIndexOf("/")
+            );
+
+            const target = normalizeProjectPath(
+                `${directory}/${specifier}`
+            );
+
+            const hasExtension = /\.(js|jsx|ts|tsx|css|json)$/.test(target);
+
+            const candidates = hasExtension
+                ? [target]
+                : [
+                    `${target}.js`,
+                    `${target}.jsx`,
+                    `${target}.ts`,
+                    `${target}.tsx`,
+                    `${target}.css`,
+                    `${target}/index.js`,
+                    `${target}/index.jsx`,
+                ];
+
+            const exists = candidates.some((candidate) =>
+                existingFiles.has(candidate)
+            );
+
+            if (!exists) {
+                const suggestedPath = hasExtension
+                    ? target
+                    : `${target}.js`;
+
+                missing.push({
+                    path: suggestedPath,
+                    importer: filePath,
+                    specifier,
+                });
+            }
+        }
+    }
+
+    // Avoid generating the same missing component more than once.
+    return [
+        ...new Map(
+            missing.map((item) => [item.path, item])
+        ).values(),
+    ];
+}
+
 
 // Generate project files: plan first, then build files in order with fallback retries.
 export async function generateProject(prompt, callbacks) {
@@ -210,33 +367,133 @@ export async function generateProject(prompt, callbacks) {
         );
 
         // Keep the preview bootable if an individual file exhausts its retries.
-        for (const failedFile of pendingFiles) {
-            const path = failedFile.path.startsWith("/")
-                ? failedFile.path
-                : `/${failedFile.path}`;
-            const ext = path.split(".").pop()?.toLowerCase();
+        if (pendingFiles.length > 0) {
+            const failedPaths = pendingFiles.map((f) => f.path).join(", ");
 
-            if (ext === "css") {
-                files[path] = `/* ${failedFile.description} — generation failed; please retry */\n`;
-            } else {
-                files[path] =
-                    "import React from 'react';\n\n" +
-                    `// This file could not be generated. Please retry.\n` +
-                    `// Purpose: ${failedFile.description}\n\n` +
-                    "export default function Placeholder() {\n" +
-                    "  return (\n" +
-                    "    <div className='p-8 text-center text-zinc-400'>\n" +
-                    "      <p>Component generation failed. Please try again.</p>\n" +
-                    "    </div>\n" +
-                    "  );\n" +
-                    "}\n";
-            }
+            console.error(
+                `[AI] Failed to generate ${pendingFiles.length} files after all retry rounds: ${failedPaths}`
+            );
         }
     }
+
+
+    // Phase 3: Project Integrity Check & Missing File Recovery
+    console.log("[Integrity] Checking generated project imports...");
+
+    const maxMissingFileRounds = 3;
+    const attemptedMissingFiles = new Set();
+
+    for (let round = 1; round <= maxMissingFileRounds; round++) {
+        const missingFiles = findMissingLocalImports(files).filter(
+            (item) =>
+                !files[item.path] &&
+                !attemptedMissingFiles.has(item.path)
+        );
+
+        if (missingFiles.length === 0) {
+            break;
+        }
+
+        console.warn(
+            `[Integrity] Found ${missingFiles.length} missing imports:`,
+            missingFiles.map((item) => item.path)
+        );
+
+        const descriptors = missingFiles.map((item) => {
+            attemptedMissingFiles.add(item.path);
+
+            // Reuse the original planned file if it already exists.
+            const existingDescriptor = plan.files.find(
+                (file) => normalizeProjectPath(file.path) === item.path
+            );
+
+            if (existingDescriptor) {
+                return existingDescriptor;
+            }
+
+            const isCSS = item.path.endsWith(".css");
+            const name = item.path.split("/").pop().replace(/\.[^.]+$/, "");
+
+            const descriptor = {
+                path: item.path,
+                description: isCSS
+                    ? `Stylesheet imported by ${item.importer}`
+                    : `Missing React component ${name}, imported by ${item.importer}. Generate a complete, functional component matching the existing project design.`,
+                exports: isCSS ? "none" : "default",
+                imports: [],
+            };
+
+            plan.files.push(descriptor);
+
+            return descriptor;
+        });
+
+        const recoveryResults = await pMap(
+            descriptors,
+            async (file) => {
+                try {
+                    console.log(`[Integrity] Generating missing file: ${file.path}`);
+
+                    if (callbacks?.onFileStart) {
+                        await callbacks.onFileStart(file.path);
+                    }
+
+                    const result = await generateSingleFile(
+                        file,
+                        plan.files,
+                        prompt,
+                        files
+                    );
+
+                    if (callbacks?.onFileComplete) {
+                        await callbacks.onFileComplete(
+                            file.path,
+                            result.code
+                        );
+                    }
+
+                    return { success: true, result };
+                } catch (error) {
+                    console.error(
+                        `[Integrity] Could not recover ${file.path}:`,
+                        error.message
+                    );
+
+                    return { success: false, file, error };
+                }
+            },
+            { concurrency: MAX_CONCURRENCY }
+        );
+
+        for (const entry of recoveryResults) {
+            if (!entry.success) {
+                throw new Error(
+                    `Could not generate required file ${entry.file.path}: ${entry.error.message}`
+                );
+            }
+
+            files[entry.result.path] = entry.result.code;
+        }
+    }
+
+    // Final integrity check
+    const unresolvedImports = findMissingLocalImports(files);
+
+    if (unresolvedImports.length > 0) {
+        throw new Error(
+            "Project has unresolved imports: " +
+            unresolvedImports.map(
+                (item) => `${item.importer} -> ${item.specifier}`
+            ).join(", ")
+        );
+    }
+
+    console.log("[Integrity] All local imports resolved successfully.");
 
     if (!files["/App.js"]) {
         throw new Error("AI did not generate /App.js entry point");
     }
+
 
     return { files, description: plan.projectDescription };
 }

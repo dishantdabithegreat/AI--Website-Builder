@@ -24,10 +24,23 @@ export function validateAndFixCode(code, filePath, context) {
     code = code.replace(/^```(?:jsx?|javascript|css|html|tsx?|react)?\s*\n/, "");
     code = code.replace(/\n```\s*$/, "");
 
+
     if (isCSS) {
-        // CSS-specific fixes — minimal, just trim and return
-        return { code: code.trim() + "\n", warnings };
+        // Remove Markdown headings accidentally generated as CSS.
+        code = code.replace(
+            /^\s*#\s+(.+)$/gm,
+            "/* $1 */"
+        );
+
+        // Remove remaining Markdown code fences.
+        code = code.replace(/^```(?:css)?\s*$/gm, "");
+
+        return {
+            code: code.trim() + "\n",
+            warnings
+        };
     }
+
 
     if (!isJS) {
         return { code, warnings };
